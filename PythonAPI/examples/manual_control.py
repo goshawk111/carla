@@ -49,6 +49,8 @@ Use ARROWS or WASD keys for control.
     F1           : toggle HUD
     H/?          : toggle help
     ESC          : quit
+
+    E            : Switch to PID speed control mode [Test]
 """
 
 from __future__ import print_function
@@ -88,6 +90,7 @@ import logging
 import math
 import random
 import re
+import time
 import weakref
 
 try:
@@ -113,6 +116,7 @@ try:
     from pygame.locals import K_b
     from pygame.locals import K_c
     from pygame.locals import K_d
+    from pygame.locals import K_e
     from pygame.locals import K_g
     from pygame.locals import K_h
     from pygame.locals import K_i
@@ -137,6 +141,13 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+# ==============================================================================
+# -- Constant Values -----------------------------------------------------------
+# ==============================================================================
+PID_DELTA_TIME = 0.2
+PID_KP = 0.1
+PID_KI = 0.05
+PID_KD = 0.01
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -317,7 +328,46 @@ class World(object):
         if self.player is not None:
             self.player.destroy()
 
+# ==============================================================================
+# -- PIDControl ----------------------------------------------------------------
+# ==============================================================================
+class PID:
+    def __init__(self, P=PID_KP, I=PID_KI, D=PID_KD, delta_time=PID_DELTA_TIME):
+        self.Kp = P
+        self.Ki = I
+        self.Kd = D
+        self.targetPos = 0.
+        self.clear()
+        self.delta_time = delta_time
 
+    def clear(self):
+        self.SetPoint = 0.0
+        self.PTerm = 0.0
+        self.ITerm = 0.0
+        self.DTerm = 0.0
+        self.last_error = 0.0
+        # Windup Guard
+        self.int_error = 0.0
+        self.windup_guard = 20.0
+        self.output = 0.0
+
+    def update(self, feedback_value):
+        error = self.targetPos - feedback_value
+        delta_error = error - self.last_error  
+        self.PTerm = self.Kp * error
+        self.ITerm += error * self.delta_time
+
+        if (self.ITerm > self.windup_guard):
+            self.ITerm = self.windup_guard
+        if(self.ITerm < -self.windup_guard):
+            self.ITerm = -self.windup_guard
+           
+        self.DTerm = delta_error / self.delta_time
+        self.last_error = error
+        self.output = self.PTerm + (self.Ki * self.ITerm) + (self.Kd * self.DTerm)
+
+    def setTargetPosition(self, targetPos):
+        self.targetPos = targetPos
 # ==============================================================================
 # -- KeyboardControl -----------------------------------------------------------
 # ==============================================================================
@@ -339,6 +389,10 @@ class KeyboardControl(object):
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
+
+        self._is_enable_pid = False
+        self._pid = PID()
+
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
     def parse_events(self, client, world, clock):
@@ -350,6 +404,19 @@ class KeyboardControl(object):
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
+                elif event.key == K_e:
+                    if self._is_enable_pid:
+                        world.hud.notification("Disabled PID Velocity Mode")                        
+                        print('Disabled PID Velocity Mode')
+                        self._is_enable_pid = False
+                    else:
+                        v = world.player.get_velocity()
+                        speed_kmph = (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
+                        self._pid.setTargetPosition(speed_kmph)
+                        self._is_enable_pid = True
+                        world.hud.notification(f"Enabled PID Velocity Mode : target={speed_kmph}km/h")
+                        print(f"Enabled PID Velocity Mode : target={speed_kmph}km/h")
+                    
                 elif event.key == K_BACKSPACE:
                     if self._autopilot_enabled:
                         world.player.set_autopilot(False)
@@ -476,7 +543,7 @@ class KeyboardControl(object):
 
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time(), world)
                 self._control.reverse = self._control.gear < 0
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
@@ -494,7 +561,7 @@ class KeyboardControl(object):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time(), world)
             world.player.apply_control(self._control)
 
-    def _parse_vehicle_keys(self, keys, milliseconds):
+    def _parse_vehicle_keys(self, keys, milliseconds, world):
         if keys[K_UP] or keys[K_w]:
             self._control.throttle = min(self._control.throttle + 0.01, 1)
         else:
@@ -504,6 +571,13 @@ class KeyboardControl(object):
             self._control.brake = min(self._control.brake + 0.2, 1)
         else:
             self._control.brake = 0
+
+        if self._is_enable_pid:
+            v = world.player.get_velocity()
+            speed_kmph = (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
+            self._pid.update(speed_kmph)
+            self._control.throttle = min(1, max(0, self._pid.output))
+            time.sleep(PID_DELTA_TIME)  # TODO: To correspond to variable period PID
 
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
